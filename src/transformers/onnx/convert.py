@@ -179,9 +179,7 @@ def export_pytorch(
                         f=output.as_posix(),
                         input_names=list(config.inputs.keys()),
                         output_names=onnx_outputs,
-                        dynamic_axes={
-                            name: axes for name, axes in chain(config.inputs.items(), config.outputs.items())
-                        },
+                        dynamic_axes=dict(chain(config.inputs.items(), config.outputs.items())),
                         do_constant_folding=True,
                         use_external_data_format=config.use_external_data_format(model.num_parameters()),
                         enable_onnx_checker=True,
@@ -208,7 +206,7 @@ def export_pytorch(
                     f=output.as_posix(),
                     input_names=list(config.inputs.keys()),
                     output_names=onnx_outputs,
-                    dynamic_axes={name: axes for name, axes in chain(config.inputs.items(), config.outputs.items())},
+                    dynamic_axes=dict(chain(config.inputs.items(), config.outputs.items())),
                     do_constant_folding=True,
                     opset_version=opset,
                 )
@@ -336,12 +334,12 @@ def export(
         preprocessor = tokenizer
 
     if is_torch_available():
-        from ..utils import torch_version
+        from ..utils import get_torch_version
 
         if not config.is_torch_support_available:
             logger.warning(
                 f"Unsupported PyTorch version for this model. Minimum required is {config.torch_onnx_minimum_version},"
-                f" got: {torch_version}"
+                f" got: {get_torch_version()}"
             )
 
     if is_torch_available() and issubclass(type(model), PreTrainedModel):

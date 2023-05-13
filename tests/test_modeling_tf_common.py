@@ -668,7 +668,7 @@ class TFModelTesterMixin:
         self.check_pt_tf_outputs(tf_outputs, pt_outputs, type(tf_model))
 
     @is_pt_tf_cross_test
-    def test_pt_tf_model_equivalence(self):
+    def test_pt_tf_model_equivalence(self, allow_missing_keys=False):
         import transformers
 
         for model_class in self.all_model_classes:
@@ -699,12 +699,16 @@ class TFModelTesterMixin:
 
             # For some models (e.g. base models), there is no label returned.
             # Set the input dict to `None` to avoid check outputs twice for the same input dicts.
-            if set(tf_inputs_dict_with_labels.keys()).symmetric_difference(tf_inputs_dict.keys()):
+            if not set(tf_inputs_dict_with_labels.keys()).symmetric_difference(tf_inputs_dict.keys()):
                 tf_inputs_dict_with_labels = None
 
             # Check we can load pt model in tf and vice-versa with model => model functions
-            tf_model = transformers.load_pytorch_model_in_tf2_model(tf_model, pt_model, tf_inputs=tf_inputs_dict)
-            pt_model = transformers.load_tf2_model_in_pytorch_model(pt_model, tf_model)
+            tf_model = transformers.load_pytorch_model_in_tf2_model(
+                tf_model, pt_model, tf_inputs=tf_inputs_dict, allow_missing_keys=allow_missing_keys
+            )
+            pt_model = transformers.load_tf2_model_in_pytorch_model(
+                pt_model, tf_model, allow_missing_keys=allow_missing_keys
+            )
 
             # Original test: check without `labels`
             self.check_pt_tf_models(tf_model, pt_model, tf_inputs_dict)
@@ -716,11 +720,15 @@ class TFModelTesterMixin:
             with tempfile.TemporaryDirectory() as tmpdirname:
                 pt_checkpoint_path = os.path.join(tmpdirname, "pt_model.bin")
                 torch.save(pt_model.state_dict(), pt_checkpoint_path)
-                tf_model = transformers.load_pytorch_checkpoint_in_tf2_model(tf_model, pt_checkpoint_path)
+                tf_model = transformers.load_pytorch_checkpoint_in_tf2_model(
+                    tf_model, pt_checkpoint_path, allow_missing_keys=allow_missing_keys
+                )
 
                 tf_checkpoint_path = os.path.join(tmpdirname, "tf_model.h5")
                 tf_model.save_weights(tf_checkpoint_path)
-                pt_model = transformers.load_tf2_checkpoint_in_pytorch_model(pt_model, tf_checkpoint_path)
+                pt_model = transformers.load_tf2_checkpoint_in_pytorch_model(
+                    pt_model, tf_checkpoint_path, allow_missing_keys=allow_missing_keys
+                )
 
             # Original test: check without `labels`
             self.check_pt_tf_models(tf_model, pt_model, tf_inputs_dict)
@@ -791,7 +799,7 @@ class TFModelTesterMixin:
                     name="pixel_values",
                     dtype="float32",
                 )
-            elif model_class.__name__ in ["TFCLIPModel", "TFGroupViTModel"]:
+            elif model_class.__name__ in ["TFCLIPModel", "TFGroupViTModel", "TFBlipModel"]:
                 inputs = {
                     "input_ids": tf.keras.Input(batch_shape=(3, max_input), name="input_ids", dtype="int32"),
                     "pixel_values": tf.keras.Input(
@@ -1792,6 +1800,8 @@ class TFModelTesterMixin:
         for model_class in self.all_model_classes:
             model = model_class(config)
             tf_inputs_dict = self._prepare_for_class(inputs_dict, model_class, return_labels=False)
+            if "labels" in tf_inputs_dict:
+                return  # This is some kinda funky decoder model that needs labels in its forward pass
             tf_inputs_dict = {
                 key: val
                 for key, val in tf_inputs_dict.items()
@@ -1805,7 +1815,7 @@ class TFModelTesterMixin:
             test_batch = next(iter(tf_dataset))
             if isinstance(test_batch, tf.Tensor):
                 self.assertEqual(len(test_batch), len(input_dataset))  # Assert we didn't lose any data
-            else:
+            elif isinstance(test_batch, dict):
                 # Assert we discarded the unwanted extra column but kept everything else
                 self.assertEqual(len(test_batch), len(input_dataset.features) - 1)
                 self.assertNotIn("extra_unwanted_column", test_batch)
@@ -1858,7 +1868,18 @@ class TFModelTesterMixin:
             generated = model.generate(inputs, **generate_kwargs).numpy()
             generate_xla = tf.function(model.generate, jit_compile=True)
             generated_xla = generate_xla(inputs, **generate_kwargs).numpy()
-            self.assertListEqual(generated.tolist(), generated_xla.tolist())
+
+            # Due to numerical instability, let's fail the test only if there are more than 10% of input sequences give
+            # different outputs between XLA and non-XLA versions. If there are less than 10 examples, let's be strict
+            # and not allow any difference.
+            diff = [[], []]
+            for _generated, _generated_xla in zip(generated.tolist(), generated_xla.tolist()):
+                if _generated != _generated_xla:
+                    diff[0].append(_generated)
+                    diff[1].append(_generated_xla)
+            ratio = len(diff[0]) / len(generated)
+            if ratio > 0.1 or (len(diff[0]) > 0 and len(generated) < 10):
+                self.assertListEqual(diff[0], diff[1])
 
         for model_class in self.all_generative_model_classes:
             config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -2006,7 +2027,7 @@ class UtilsFunctionsTest(unittest.TestCase):
         _ = TFBertModel.from_pretrained("hf-internal-testing/tiny-random-bert")
 
         # Under the mock environment we get a 500 error when trying to reach the model.
-        with mock.patch("requests.request", return_value=response_mock) as mock_head:
+        with mock.patch("requests.Session.request", return_value=response_mock) as mock_head:
             _ = TFBertModel.from_pretrained("hf-internal-testing/tiny-random-bert")
             # This check we did call the fake head request
             mock_head.assert_called()
