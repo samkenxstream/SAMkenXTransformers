@@ -52,12 +52,12 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
+from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.30.0.dev0")
+check_min_version("4.32.0.dev0")
 
 logger = get_logger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/translation/requirements.txt")
@@ -316,7 +316,7 @@ def main():
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
     accelerator = (
-        Accelerator(log_with=args.report_to, logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+        Accelerator(log_with=args.report_to, project_dir=args.output_dir) if args.with_tracking else Accelerator()
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -340,12 +340,14 @@ def main():
     # Handle the repository creation
     if accelerator.is_main_process:
         if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
+            # Retrieve of infer repo_name
+            repo_name = args.hub_model_id
+            if repo_name is None:
+                repo_name = Path(args.output_dir).absolute().name
+            # Create repo and retrieve repo_id
+            repo_id = create_repo(repo_name, exist_ok=True, token=args.hub_token).repo_id
+            # Clone repo locally
+            repo = Repository(args.output_dir, clone_from=repo_id, token=args.hub_token)
 
             with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
@@ -613,7 +615,7 @@ def main():
             resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
-            completed_steps = resume_step
+            completed_steps = resume_step // args.gradient_accumulation_stepp
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)

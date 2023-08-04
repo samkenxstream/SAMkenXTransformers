@@ -110,10 +110,9 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
                 num = int(scope_names[1])
                 pointer = pointer[num]
         try:
-            assert (
-                pointer.shape == array.shape
-            ), f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched"
-        except AssertionError as e:
+            if pointer.shape != array.shape:
+                raise ValueError(f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched")
+        except ValueError as e:
             e.args += (pointer.shape, array.shape)
             raise
         logger.info(f"Initialize PyTorch weight {name}")
@@ -449,6 +448,7 @@ class GPT2PreTrainedModel(PreTrainedModel):
     is_parallelizable = True
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPT2Block"]
+    _skip_keys_device_placement = "past_key_values"
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -667,8 +667,6 @@ DEPARALLELIZE_DOCSTRING = r"""
     GPT2_START_DOCSTRING,
 )
 class GPT2Model(GPT2PreTrainedModel):
-    _keys_to_ignore_on_load_missing = ["attn.masked_bias"]
-
     def __init__(self, config):
         super().__init__(config)
 
@@ -955,8 +953,7 @@ class GPT2Model(GPT2PreTrainedModel):
     GPT2_START_DOCSTRING,
 )
 class GPT2LMHeadModel(GPT2PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
-    _keys_to_ignore_on_load_unexpected = [r"h\.\d+\.attn\.masked_bias", r"h\.\d+\.attn\.bias"]
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1148,7 +1145,7 @@ input sequence).
     GPT2_START_DOCSTRING,
 )
 class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
+    _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1376,8 +1373,6 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
     GPT2_START_DOCSTRING,
 )
 class GPT2ForSequenceClassification(GPT2PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"lm_head.weight"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1448,7 +1443,9 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                sequence_lengths = (torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1).to(logits.device)
+                sequence_lengths = (torch.eq(input_ids, self.config.pad_token_id).long().argmax(-1) - 1).to(
+                    logits.device
+                )
             else:
                 sequence_lengths = -1
                 logger.warning(
@@ -1599,8 +1596,6 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
     GPT2_START_DOCSTRING,
 )
 class GPT2ForQuestionAnswering(GPT2PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"h\.\d+\.attn\.bias", r"lm_head.weight"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels

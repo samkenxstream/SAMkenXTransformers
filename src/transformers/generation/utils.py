@@ -33,11 +33,12 @@ from ..models.auto import (
     MODEL_FOR_SPEECH_SEQ_2_SEQ_MAPPING,
     MODEL_FOR_VISION_2_SEQ_MAPPING,
 )
-from ..utils import ModelOutput, logging
+from ..utils import ExplicitEnum, ModelOutput, logging
 from .beam_constraints import DisjunctiveConstraint, PhrasalConstraint
 from .beam_search import BeamScorer, BeamSearchScorer, ConstrainedBeamSearchScorer
 from .configuration_utils import GenerationConfig
 from .logits_process import (
+    ClassifierFreeGuidanceLogitsProcessor,
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
     EpsilonLogitsWarper,
@@ -56,6 +57,7 @@ from .logits_process import (
     NoRepeatNGramLogitsProcessor,
     PrefixConstrainedLogitsProcessor,
     RepetitionPenaltyLogitsProcessor,
+    SequenceBiasLogitsProcessor,
     SuppressTokensAtBeginLogitsProcessor,
     SuppressTokensLogitsProcessor,
     TemperatureLogitsWarper,
@@ -466,6 +468,23 @@ ContrastiveSearchOutput = Union[ContrastiveSearchEncoderDecoderOutput, Contrasti
 GenerateOutput = Union[GreedySearchOutput, SampleOutput, BeamSearchOutput, BeamSampleOutput, ContrastiveSearchOutput]
 
 
+class GenerationMode(ExplicitEnum):
+    """
+    Possible generation modes, downstream of the [`~generation.GenerationMixin.generate`] method.
+    """
+
+    # Non-beam methods
+    CONTRASTIVE_SEARCH = "contrastive_search"
+    GREEDY_SEARCH = "greedy_search"
+    SAMPLE = "sample"
+    ASSISTED_GENERATION = "assisted_generation"
+    # Beam methods
+    BEAM_SEARCH = "beam_search"
+    BEAM_SAMPLE = "beam_sample"
+    CONSTRAINED_BEAM_SEARCH = "constrained_beam_search"
+    GROUP_BEAM_SEARCH = "group_beam_search"
+
+
 class GenerationMixin:
     """
     A class containing all functions for auto-regressive text generation, to be used as a mixin in [`PreTrainedModel`].
@@ -616,6 +635,10 @@ class GenerationMixin:
     ) -> Dict[str, Any]:
         # 1. get encoder
         encoder = self.get_encoder()
+        # Compatibility with Accelerate big model inference: we need the encoder to outputs stuff on the same device
+        # as the inputs.
+        if hasattr(encoder, "_hf_hook"):
+            encoder._hf_hook.io_same_device = True
 
         # 2. Prepare encoder args and encoder kwargs from model kwargs.
         irrelevant_prefix = ["decoder_", "cross_attn", "use_cache"]
@@ -823,6 +846,46 @@ class GenerationMixin:
             warpers.append(LogitNormalization())
         return warpers
 
+    def _get_generation_mode(
+        self, generation_config: GenerationConfig, assistant_model: Optional["PreTrainedModel"]
+    ) -> GenerationMode:
+        """
+        Returns the generation mode triggered by a [`GenerationConfig`] instance.
+        """
+        if generation_config.constraints is not None or generation_config.force_words_ids is not None:
+            generation_mode = GenerationMode.CONSTRAINED_BEAM_SEARCH
+        elif generation_config.num_beams == 1:
+            if generation_config.do_sample is False:
+                if (
+                    generation_config.top_k is not None
+                    and generation_config.top_k > 1
+                    and generation_config.penalty_alpha is not None
+                    and generation_config.penalty_alpha > 0
+                ):
+                    generation_mode = GenerationMode.CONTRASTIVE_SEARCH
+                else:
+                    generation_mode = GenerationMode.GREEDY_SEARCH
+            else:
+                generation_mode = GenerationMode.SAMPLE
+        else:
+            if generation_config.num_beam_groups > 1:
+                generation_mode = GenerationMode.GROUP_BEAM_SEARCH
+            elif generation_config.do_sample is True:
+                generation_mode = GenerationMode.BEAM_SAMPLE
+            else:
+                generation_mode = GenerationMode.BEAM_SEARCH
+
+        # Assisted generation may extend some generation modes
+        if assistant_model is not None:
+            if generation_mode in ("greedy_search", "sample"):
+                generation_mode = GenerationMode.ASSISTED_GENERATION
+            else:
+                raise ValueError(
+                    "You've set `assistant_model`, which triggers assisted generate. Currently, assisted generate "
+                    "is only supported with Greedy Search and Sample."
+                )
+        return generation_mode
+
     def _get_logits_processor(
         self,
         generation_config: GenerationConfig,
@@ -838,8 +901,9 @@ class GenerationMixin:
         # instantiate processors list
         processors = LogitsProcessorList()
 
-        # the following idea is largely copied from this PR: https://github.com/huggingface/transformers/pull/5420/files
-        # all samplers can be found in `generation_utils_samplers.py`
+        if generation_config.sequence_bias is not None:
+            processors.append(SequenceBiasLogitsProcessor(sequence_bias=generation_config.sequence_bias))
+
         if generation_config.diversity_penalty is not None and generation_config.diversity_penalty > 0.0:
             processors.append(
                 HammingDiversityLogitsProcessor(
@@ -934,6 +998,8 @@ class GenerationMixin:
             )
         if generation_config.forced_decoder_ids is not None:
             processors.append(ForceTokensLogitsProcessor(generation_config.forced_decoder_ids))
+        if generation_config.guidance_scale is not None and generation_config.guidance_scale > 1:
+            processors.append(ClassifierFreeGuidanceLogitsProcessor(generation_config.guidance_scale))
         processors = self._merge_criteria_processor_list(processors, logits_processor)
         # `LogitNormalization` should always be the last logit processor, when present
         if generation_config.renormalize_logits is True:
@@ -945,7 +1011,13 @@ class GenerationMixin:
     ) -> StoppingCriteriaList:
         criteria = StoppingCriteriaList()
         if generation_config.max_length is not None:
-            criteria.append(MaxLengthCriteria(max_length=generation_config.max_length))
+            max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
+            criteria.append(
+                MaxLengthCriteria(
+                    max_length=generation_config.max_length,
+                    max_position_embeddings=max_position_embeddings,
+                )
+            )
         if generation_config.max_time is not None:
             criteria.append(MaxTimeCriteria(max_time=generation_config.max_time))
         criteria = self._merge_criteria_processor_list(criteria, stopping_criteria)
@@ -1132,6 +1204,32 @@ class GenerationMixin:
         # `prepare_inputs_for_generation` doesn't accept them, then a stricter check can be made ;)
         if "kwargs" in model_args or "model_kwargs" in model_args:
             model_args |= set(inspect.signature(self.forward).parameters)
+
+        # Encoder-Decoder models may also need Encoder arguments from `model_kwargs`
+        if self.config.is_encoder_decoder:
+            base_model = getattr(self, self.base_model_prefix, None)
+
+            # allow encoder kwargs
+            encoder = getattr(self, "encoder", None)
+            # `MusicgenForConditionalGeneration` has `text_encoder` and `audio_encoder`.
+            # Also, it has `base_model_prefix = "encoder_decoder"` but there is no `self.encoder_decoder`
+            # TODO: A better way to handle this.
+            if encoder is None and base_model is not None:
+                encoder = getattr(base_model, "encoder", None)
+
+            if encoder is not None:
+                encoder_model_args = set(inspect.signature(encoder.forward).parameters)
+                model_args |= encoder_model_args
+
+            # allow decoder kwargs
+            decoder = getattr(self, "decoder", None)
+            if decoder is None and base_model is not None:
+                decoder = getattr(base_model, "decoder", None)
+
+            if decoder is not None:
+                decoder_model_args = set(inspect.signature(decoder.forward).parameters)
+                model_args |= {f"decoder_{x}" for x in decoder_model_args}
+
         for key, value in model_kwargs.items():
             if value is not None and key not in model_args:
                 unused_model_args.append(key)
@@ -1210,7 +1308,7 @@ class GenerationMixin:
             streamer (`BaseStreamer`, *optional*):
                 Streamer object that will be used to stream the generated sequences. Generated tokens are passed
                 through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
-            kwargs:
+            kwargs (`Dict[str, Any]`, *optional*):
                 Ad hoc parametrization of `generate_config` and/or additional model-specific kwargs that will be
                 forwarded to the `forward` function of the model. If the model is an encoder-decoder model, encoder
                 specific kwargs should not be prefixed and decoder specific kwargs should be prefixed with *decoder_*.
@@ -1256,7 +1354,7 @@ class GenerationMixin:
                         "You have modified the pretrained model configuration to control generation. This is a"
                         " deprecated strategy to control generation and will be removed soon, in a future version."
                         " Please use a generation configuration file (see"
-                        " https://huggingface.co/docs/transformers/main_classes/text_generation)"
+                        " https://huggingface.co/docs/transformers/main_classes/text_generation )"
                     )
                     self.generation_config = new_generation_config
             generation_config = self.generation_config
@@ -1295,7 +1393,12 @@ class GenerationMixin:
         # 4. Define other model kwargs
         model_kwargs["output_attentions"] = generation_config.output_attentions
         model_kwargs["output_hidden_states"] = generation_config.output_hidden_states
-        model_kwargs["use_cache"] = generation_config.use_cache
+        # decoder-only models with inputs_embeds forwarding must use caching (otherwise we can't detect whether we are
+        # generating the first new token or not, and we only want to use the embeddings for the first new token)
+        if not self.config.is_encoder_decoder and model_input_name == "inputs_embeds":
+            model_kwargs["use_cache"] = True
+        else:
+            model_kwargs["use_cache"] = generation_config.use_cache
 
         accepts_attention_mask = "attention_mask" in set(inspect.signature(self.forward).parameters.keys())
         requires_attention_mask = "encoder_outputs" not in model_kwargs
@@ -1345,11 +1448,11 @@ class GenerationMixin:
         # 6. Prepare `max_length` depending on other stopping criteria.
         input_ids_seq_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        if has_default_max_length and generation_config.max_new_tokens is None:
+        if has_default_max_length and generation_config.max_new_tokens is None and generation_config.max_length != 20:
+            # 20 is the default max_length of the generation config
             warnings.warn(
-                f"Using `max_length`'s default ({generation_config.max_length}) to control the generation length. "
-                "This behaviour is deprecated and will be removed from the config in v5 of Transformers -- we"
-                " recommend using `max_new_tokens` to control the maximum length of the generation.",
+                f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
+                "to control the generation length.  recommend setting `max_new_tokens` to control the maximum length of the generation.",
                 UserWarning,
             )
         elif generation_config.max_new_tokens is not None:
@@ -1376,65 +1479,11 @@ class GenerationMixin:
             )
 
         # 7. determine generation mode
-        is_constraint_gen_mode = (
-            generation_config.constraints is not None or generation_config.force_words_ids is not None
-        )
-
-        is_contrastive_search_gen_mode = (
-            (generation_config.num_beams == 1)
-            and generation_config.top_k is not None
-            and generation_config.top_k > 1
-            and generation_config.do_sample is False
-            and generation_config.penalty_alpha is not None
-            and generation_config.penalty_alpha > 0
-        )
-
-        is_greedy_gen_mode = (
-            (generation_config.num_beams == 1)
-            and (generation_config.num_beam_groups == 1)
-            and generation_config.do_sample is False
-            and not is_constraint_gen_mode
-            and not is_contrastive_search_gen_mode
-        )
-        is_sample_gen_mode = (
-            (generation_config.num_beams == 1)
-            and (generation_config.num_beam_groups == 1)
-            and generation_config.do_sample is True
-            and not is_constraint_gen_mode
-            and not is_contrastive_search_gen_mode
-        )
-        is_beam_gen_mode = (
-            (generation_config.num_beams > 1)
-            and (generation_config.num_beam_groups == 1)
-            and generation_config.do_sample is False
-            and not is_constraint_gen_mode
-            and not is_contrastive_search_gen_mode
-        )
-        is_beam_sample_gen_mode = (
-            (generation_config.num_beams > 1)
-            and (generation_config.num_beam_groups == 1)
-            and generation_config.do_sample is True
-            and not is_constraint_gen_mode
-            and not is_contrastive_search_gen_mode
-        )
-        is_group_beam_gen_mode = (
-            (generation_config.num_beams > 1)
-            and (generation_config.num_beam_groups > 1)
-            and not is_constraint_gen_mode
-            and not is_contrastive_search_gen_mode
-        )
-        is_assisted_gen_mode = False
-        if assistant_model is not None:
-            if not (is_greedy_gen_mode or is_sample_gen_mode):
-                raise ValueError(
-                    "You've set `assistant_model`, which triggers assisted generate. Currently, assisted generate "
-                    "is only supported with Greedy Search and Sample."
-                )
-            is_assisted_gen_mode = True
+        generation_mode = self._get_generation_mode(generation_config, assistant_model)
 
         if generation_config.num_beam_groups > generation_config.num_beams:
             raise ValueError("`num_beam_groups` has to be smaller or equal to `num_beams`")
-        if is_group_beam_gen_mode and generation_config.do_sample is True:
+        if generation_mode == GenerationMode.GROUP_BEAM_SEARCH and generation_config.do_sample is True:
             raise ValueError(
                 "Diverse beam search cannot be used in sampling mode. Make sure that `do_sample` is set to `False`."
             )
@@ -1469,7 +1518,7 @@ class GenerationMixin:
             generation_config=generation_config, stopping_criteria=stopping_criteria
         )
         # 10. go into different generation modes
-        if is_assisted_gen_mode:
+        if generation_mode == GenerationMode.ASSISTED_GENERATION:
             if generation_config.num_return_sequences > 1:
                 raise ValueError(
                     "num_return_sequences has to be 1 when doing assisted generate, "
@@ -1507,7 +1556,7 @@ class GenerationMixin:
                 streamer=streamer,
                 **model_kwargs,
             )
-        if is_greedy_gen_mode:
+        if generation_mode == GenerationMode.GREEDY_SEARCH:
             if generation_config.num_return_sequences > 1:
                 raise ValueError(
                     "num_return_sequences has to be 1 when doing greedy search, "
@@ -1528,7 +1577,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif is_contrastive_search_gen_mode:
+        elif generation_mode == GenerationMode.CONTRASTIVE_SEARCH:
             if generation_config.num_return_sequences > 1:
                 raise ValueError(
                     "num_return_sequences has to be 1 when doing contrastive search, "
@@ -1549,10 +1598,11 @@ class GenerationMixin:
                 return_dict_in_generate=generation_config.return_dict_in_generate,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                sequential=generation_config.low_memory,
                 **model_kwargs,
             )
 
-        elif is_sample_gen_mode:
+        elif generation_mode == GenerationMode.SAMPLE:
             # 11. prepare logits warper
             logits_warper = self._get_logits_warper(generation_config)
 
@@ -1579,7 +1629,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif is_beam_gen_mode:
+        elif generation_mode == GenerationMode.BEAM_SEARCH:
             if generation_config.num_return_sequences > generation_config.num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
 
@@ -1617,7 +1667,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif is_beam_sample_gen_mode:
+        elif generation_mode == GenerationMode.BEAM_SAMPLE:
             # 11. prepare logits warper
             logits_warper = self._get_logits_warper(generation_config)
 
@@ -1656,12 +1706,17 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif is_group_beam_gen_mode:
+        elif generation_mode == GenerationMode.GROUP_BEAM_SEARCH:
             if generation_config.num_return_sequences > generation_config.num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
 
             if generation_config.num_beams % generation_config.num_beam_groups != 0:
                 raise ValueError("`num_beams` should be divisible by `num_beam_groups` for group beam search.")
+
+            if generation_config.diversity_penalty == 0.0:
+                raise ValueError(
+                    "`diversity_penalty` should be greater than `0.0`, otherwise your beam groups will be identical."
+                )
 
             if stopping_criteria.max_length is None:
                 raise ValueError("`max_length` needs to be a stopping_criteria for now.")
@@ -1702,7 +1757,7 @@ class GenerationMixin:
                 **model_kwargs,
             )
 
-        elif is_constraint_gen_mode:
+        elif generation_mode == GenerationMode.CONSTRAINED_BEAM_SEARCH:
             if generation_config.num_return_sequences > generation_config.num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
 
@@ -1807,6 +1862,7 @@ class GenerationMixin:
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
+        sequential: Optional[bool] = None,
         **model_kwargs,
     ) -> Union[ContrastiveSearchOutput, torch.LongTensor]:
         r"""
@@ -1857,6 +1913,8 @@ class GenerationMixin:
             streamer (`BaseStreamer`, *optional*):
                 Streamer object that will be used to stream the generated sequences. Generated tokens are passed
                 through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+            sequential (`bool`, *optional*):
+                Switches topk hidden state computation from parallel to sequential to reduce memory if True.
             model_kwargs:
                 Additional model specific keyword arguments will be forwarded to the `forward` function of the model.
                 If model is an encoder-decoder model the kwargs should include `encoder_outputs`.
@@ -1896,6 +1954,7 @@ class GenerationMixin:
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+        sequential = sequential if sequential is not None else self.generation_config.low_memory
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
         eos_token_id_tensor = torch.tensor(eos_token_id).to(input_ids.device) if eos_token_id is not None else None
@@ -1961,6 +2020,7 @@ class GenerationMixin:
                     last_hidden_states = outputs.decoder_hidden_states[-1]
                 else:
                     last_hidden_states = outputs.hidden_states[-1]
+
                 # next logit for contrastive search to select top-k candidate tokens
                 logit_for_next_step = outputs.logits[:, -1, :]
 
@@ -1970,11 +2030,11 @@ class GenerationMixin:
                     is_encoder_decoder=self.config.is_encoder_decoder,
                     standardize_cache_format=True,
                 )
-
-                # Expands model inputs top_k times, for batched forward passes (akin to beam search).
-                _, model_kwargs = self._expand_inputs_for_generation(
-                    expand_size=top_k, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
-                )
+                if not sequential:
+                    # Expands model inputs top_k times, for batched forward passes (akin to beam search).
+                    _, model_kwargs = self._expand_inputs_for_generation(
+                        expand_size=top_k, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
+                    )
 
                 past_key_values = model_kwargs.get("past_key_values")
                 if past_key_values is None:
@@ -1994,7 +2054,6 @@ class GenerationMixin:
             # contrastive_search main logic start:
             # contrastive search decoding consists of two steps: (1) candidate tokens recall; (2) candidate re-rank by
             # degeneration penalty
-
             logit_for_next_step = logits_processor(input_ids, logit_for_next_step)
             logit_for_next_step = logits_warper(input_ids, logit_for_next_step)
             next_probs = nn.functional.softmax(logit_for_next_step, dim=-1)
@@ -2024,30 +2083,81 @@ class GenerationMixin:
                 items = []
                 # item is either the key or the value matrix
                 for item in layer:
-                    items.append(item.repeat_interleave(top_k, dim=0))
+                    if sequential:
+                        items.append(item.repeat_interleave(1, dim=0))
+                    else:
+                        items.append(item.repeat_interleave(top_k, dim=0))
                 new_key_values.append(items)
             model_kwargs["past_key_values"] = new_key_values
 
-            # compute the candidate tokens by the language model and collects their hidden_states
-            next_model_inputs = self.prepare_inputs_for_generation(top_k_ids.view(-1, 1), **model_kwargs)
-            outputs = self(
-                **next_model_inputs, return_dict=True, output_hidden_states=True, output_attentions=output_attentions
-            )
-            next_past_key_values = self._extract_past_from_model_output(outputs, standardize_cache_format=True)
+            if sequential:
+                all_outputs = {key: [] for key in outputs}  # defined in first loop iteration
+                all_last_hstates, all_hstates, all_logits = [], [], []
+                for i in range(top_k):
+                    # compute the candidate tokens by the language model and collect their hidden_states
+                    next_model_inputs = self.prepare_inputs_for_generation(top_k_ids[:, i].view(-1, 1), **model_kwargs)
 
-            logits = outputs.logits[:, -1, :]
-            # name is different for encoder-decoder and decoder-only models
-            if self.config.is_encoder_decoder:
-                next_hidden = outputs.decoder_hidden_states[-1]
-                full_hidden_states = outputs.decoder_hidden_states
+                    outputs = self(
+                        **next_model_inputs,
+                        return_dict=True,
+                        output_hidden_states=True,
+                        output_attentions=output_attentions,
+                    )
+                    for key in all_outputs:
+                        all_outputs[key].append(outputs[key])
+
+                    if self.config.is_encoder_decoder:
+                        next_hidden = outputs.decoder_hidden_states[-1]
+                        full_hidden_states = outputs.decoder_hidden_states
+
+                    else:
+                        next_hidden = outputs.hidden_states[-1]
+                        full_hidden_states = outputs.hidden_states
+
+                    all_last_hstates.append(torch.squeeze(next_hidden, 0))
+                    all_hstates.append(full_hidden_states)
+                    all_logits.append(outputs.logits[:, -1, :])
+
+                # stack hidden states
+                next_hidden = torch.stack([all_last_hstates[i] for i in range(top_k)], dim=0)
+                final_full_hstates = [0 for i in range(len(full_hidden_states))]
+                for layer in range(len(full_hidden_states)):
+                    final_full_hstates[layer] = torch.stack(
+                        [torch.squeeze(all_hstates[i][layer], 0) for i in range(top_k)], dim=0
+                    )
+                full_hidden_states = tuple(final_full_hstates)
+
+                # stack logits
+                logits = torch.cat(all_logits, dim=0)
+
             else:
-                next_hidden = outputs.hidden_states[-1]
-                full_hidden_states = outputs.hidden_states
+                # compute the candidate tokens by the language model and collect their hidden_states
+                # assembles top_k_ids into batch of size k
+                next_model_inputs = self.prepare_inputs_for_generation(top_k_ids.view(-1, 1), **model_kwargs)
+
+                outputs = self(
+                    **next_model_inputs,
+                    return_dict=True,
+                    output_hidden_states=True,
+                    output_attentions=output_attentions,
+                )
+                # name is different for encoder-decoder and decoder-only models
+                if self.config.is_encoder_decoder:
+                    next_hidden = outputs.decoder_hidden_states[-1]
+                    full_hidden_states = outputs.decoder_hidden_states
+                else:
+                    next_hidden = outputs.hidden_states[-1]
+                    full_hidden_states = outputs.hidden_states
+
+                logits = outputs.logits[:, -1, :]
+
             context_hidden = last_hidden_states.repeat_interleave(top_k, dim=0)
 
             # compute the degeneration penalty and re-rank the candidates based on the degeneration penalty and the
-            # model confidence
+            # model confidence. Keeping `selected_idx` on CPU enables multi-device contrastive search and doesn't
+            # introduce (noticeable) slowdowns on single-device runs.
             selected_idx = _ranking_fast(context_hidden, next_hidden, top_k_probs, penalty_alpha, top_k)
+            selected_idx = selected_idx.to("cpu")
 
             # prepare for the next step: (1) next token_id; (2) past_key_values; (3) last_hidden_states for computing
             # the degeneration penalty; (4) logits for selecting next top-k candidates; (5) selected tokens scores
@@ -2062,17 +2172,32 @@ class GenerationMixin:
                 layer = torch.stack(torch.split(layer, top_k))[range(batch_size), selected_idx, :]
                 next_decoder_hidden_states += (layer,)
 
-            # select the past_key_value
-            new_key_values = ()
-            for layer in next_past_key_values:
-                items = ()
-                # item is either the key or the value matrix
-                for item in layer:
-                    item = torch.stack(torch.split(item, top_k, dim=0))  # [B, K, num_head, seq_len, esz]
-                    item = item[range(batch_size), selected_idx, ...]  # [B, num_head, seq_len, esz]
-                    items += (item,)
-                new_key_values += (items,)
-            next_past_key_values = new_key_values
+            # generate past_key_values cache of only the selected token
+            if sequential:
+                next_model_input = self.prepare_inputs_for_generation(
+                    top_k_ids[:, selected_idx].view(-1, 1), **model_kwargs
+                )
+
+                selected_outputs = self(
+                    **next_model_input,
+                    return_dict=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
+                next_past_key_values = selected_outputs["past_key_values"]
+
+            else:
+                next_past_key_values = self._extract_past_from_model_output(outputs, standardize_cache_format=True)
+                new_key_values = ()
+                for layer in next_past_key_values:
+                    items = ()
+                    # item is either the key or the value matrix
+                    for item in layer:
+                        item = torch.stack(torch.split(item, top_k, dim=0))  # [B, K, num_head, seq_len, esz]
+                        item = item[range(batch_size), selected_idx, ...]  # [B, num_head, seq_len, esz]
+                        items += (item,)
+                    new_key_values += (items,)
+                next_past_key_values = new_key_values
 
             logit_for_next_step = torch.stack(torch.split(logits, top_k))[range(batch_size), selected_idx, :]
 
@@ -2946,9 +3071,10 @@ class GenerationMixin:
             vocab_size = next_token_scores.shape[-1]
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
 
-            # Sample 2 next tokens for each beam (so we have some spare tokens and match output of beam search)
+            # Sample 1 + len(eos_token_id) next tokens for each beam so we have at least 1 non eos token per beam.
+            n_eos_tokens = len(eos_token_id) if eos_token_id else 0
             next_token_scores, next_tokens = torch.topk(
-                next_token_scores, 2 * num_beams, dim=1, largest=True, sorted=True
+                next_token_scores, max(2, 1 + n_eos_tokens) * num_beams, dim=1, largest=True, sorted=True
             )
 
             next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
@@ -3516,10 +3642,10 @@ class GenerationMixin:
             else self.generation_config.return_dict_in_generate
         )
 
-        batch_size = len(beam_scorer._beam_hyps)
         num_beams = beam_scorer.num_beams
         num_beam_groups = beam_scorer.num_beam_groups
         num_sub_beams = num_beams // num_beam_groups
+        batch_size = len(beam_scorer._beam_hyps) // num_beam_groups
         device = input_ids.device
 
         batch_beam_size, cur_len = input_ids.shape
@@ -3624,9 +3750,10 @@ class GenerationMixin:
                 # reshape for beam search
                 next_token_scores = next_token_scores.view(batch_size, group_size * vocab_size)
 
-                # Sample 2 next tokens for each beam (so we have some spare tokens and match output of beam search)
+                # Sample 1 + len(eos_token_id) next tokens for each beam so we have at least 1 non eos token per beam.
+                n_eos_tokens = len(eos_token_id) if eos_token_id else 0
                 next_token_scores, next_tokens = torch.topk(
-                    next_token_scores, 2 * group_size, dim=1, largest=True, sorted=True
+                    next_token_scores, max(2, 1 + n_eos_tokens) * group_size, dim=1, largest=True, sorted=True
                 )
 
                 next_indices = torch.div(next_tokens, vocab_size, rounding_mode="floor")
@@ -3642,6 +3769,7 @@ class GenerationMixin:
                     pad_token_id=pad_token_id,
                     eos_token_id=eos_token_id,
                     beam_indices=process_beam_indices,
+                    group_index=beam_group_idx,
                 )
                 beam_scores[batch_group_indices] = beam_outputs["next_beam_scores"]
                 beam_next_tokens = beam_outputs["next_beam_tokens"]
@@ -3903,8 +4031,21 @@ class GenerationMixin:
             else self.generation_config.return_dict_in_generate
         )
 
+        batch_size = len(constrained_beam_scorer._beam_hyps)
+        num_beams = constrained_beam_scorer.num_beams
+
+        batch_beam_size, cur_len = input_ids.shape
+
+        if num_beams * batch_size != batch_beam_size:
+            raise ValueError(
+                f"Batch dimension of `input_ids` should be {num_beams * batch_size}, but is {batch_beam_size}."
+            )
+
         # init attention / hidden states / scores tuples
         scores = () if (return_dict_in_generate and output_scores) else None
+        beam_indices = (
+            tuple(() for _ in range(batch_beam_size)) if (return_dict_in_generate and output_scores) else None
+        )
         decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
@@ -3914,16 +4055,6 @@ class GenerationMixin:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
             encoder_hidden_states = (
                 model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
-            )
-
-        batch_size = len(constrained_beam_scorer._beam_hyps)
-        num_beams = constrained_beam_scorer.num_beams
-
-        batch_beam_size, cur_len = input_ids.shape
-
-        if num_beams * batch_size != batch_beam_size:
-            raise ValueError(
-                f"Batch dimension of `input_ids` should be {num_beams * batch_size}, but is {batch_beam_size}."
             )
 
         # initialise score of first beam with 0 and the rest with -1e9. This makes sure that only tokens
@@ -3993,9 +4124,10 @@ class GenerationMixin:
             vocab_size = next_token_scores.shape[-1]
             next_token_scores = next_token_scores.view(batch_size, num_beams * vocab_size)
 
-            # Sample 2 next tokens for each beam (so we have some spare tokens and match output of beam search)
+            # Sample 1 + len(eos_token_id) next tokens for each beam so we have at least 1 non eos token per beam.
+            n_eos_tokens = len(eos_token_id) if eos_token_id else 0
             next_token_scores, next_tokens = torch.topk(
-                next_token_scores, 2 * num_beams, dim=1, largest=True, sorted=True
+                next_token_scores, max(2, 1 + n_eos_tokens) * num_beams, dim=1, largest=True, sorted=True
             )
 
             next_indices = (next_tokens / vocab_size).long()
@@ -4010,6 +4142,7 @@ class GenerationMixin:
                 scores_for_all_vocab,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
+                beam_indices=beam_indices,
             )
             beam_scores = beam_outputs["next_beam_scores"]
             beam_next_tokens = beam_outputs["next_beam_tokens"]
@@ -4021,6 +4154,9 @@ class GenerationMixin:
             )
             if model_kwargs["past_key_values"] is not None:
                 model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+
+            if return_dict_in_generate and output_scores:
+                beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
 
             # increase cur_len
             cur_len = cur_len + 1
@@ -4039,6 +4175,7 @@ class GenerationMixin:
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
             max_length=stopping_criteria.max_length,
+            beam_indices=beam_indices,
         )
 
         if return_dict_in_generate:
@@ -4049,6 +4186,7 @@ class GenerationMixin:
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
+                    beam_indices=sequence_outputs["beam_indices"],
                     encoder_attentions=encoder_attentions,
                     encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions,
@@ -4060,6 +4198,7 @@ class GenerationMixin:
                     sequences=sequence_outputs["sequences"],
                     sequences_scores=sequence_outputs["sequence_scores"],
                     scores=scores,
+                    beam_indices=sequence_outputs["beam_indices"],
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                 )
@@ -4228,6 +4367,15 @@ class GenerationMixin:
 
         # other auxiliary variables
         max_len = stopping_criteria[0].max_length
+        assistant_kv_indexing = (
+            1
+            if "bloom" in assistant_model.__class__.__name__.lower()
+            or (
+                assistant_model.config.architectures is not None
+                and "bloom" in assistant_model.config.architectures[0].lower()
+            )
+            else 0
+        )
 
         this_peer_finished = False  # used by synced_gpus only
         while True:
@@ -4243,7 +4391,6 @@ class GenerationMixin:
 
             # Assistant: main logic start
             cur_len = input_ids.shape[-1]
-            assistant_kv_indexing = 0 if "bloom" not in assistant_model.__class__.__name__.lower() else 1
 
             #  1. Forecast next N tokens using the assistant model. This `for` block can be replaced with a
             # `.generate()` call if we decide to add `past_key_values` as a possible output of generate, as we
@@ -4318,6 +4465,7 @@ class GenerationMixin:
                         encoder_outputs=model_kwargs["encoder_outputs"],
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
+                        use_cache=True,
                     )
                 else:
                     outputs = self(
@@ -4326,6 +4474,7 @@ class GenerationMixin:
                         past_key_values=model_kwargs["past_key_values"],
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
+                        use_cache=True,
                     )
             else:
                 if self.config.is_encoder_decoder:
@@ -4334,12 +4483,14 @@ class GenerationMixin:
                         encoder_outputs=model_kwargs["encoder_outputs"],
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
+                        use_cache=True,
                     )
                 else:
                     outputs = self(
                         candidate_input_ids,
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
+                        use_cache=True,
                     )
 
             # 2.2. Process the new logits
@@ -4504,7 +4655,10 @@ def _crop_past_key_values(model, past_key_values, maximum_length):
                 )
             )
         past_key_values = tuple(new_past)
-    elif "bloom" in model.__class__.__name__.lower():  # bloom is special
+    # bloom is special
+    elif "bloom" in model.__class__.__name__.lower() or (
+        model.config.architectures is not None and "bloom" in model.config.architectures[0].lower()
+    ):
         for idx in range(len(past_key_values)):
             new_past.append(
                 (
@@ -4513,7 +4667,10 @@ def _crop_past_key_values(model, past_key_values, maximum_length):
                 )
             )
         past_key_values = tuple(new_past)
-    elif "gptbigcode" in model.__class__.__name__.lower():  # gptbigcode is too
+    # gptbigcode is too
+    elif "gptbigcode" in model.__class__.__name__.lower() or (
+        model.config.architectures is not None and "gptbigcode" in model.config.architectures[0].lower()
+    ):
         if model.config.multi_query:
             for idx in range(len(past_key_values)):
                 past_key_values[idx] = past_key_values[idx][:, :maximum_length, :]

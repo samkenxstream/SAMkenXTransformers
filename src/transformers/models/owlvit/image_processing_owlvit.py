@@ -23,11 +23,9 @@ from ...image_processing_utils import BaseImageProcessor, BatchFeature, get_size
 from ...image_transforms import (
     center_crop,
     center_to_corners_format,
-    normalize,
     rescale,
     resize,
     to_channel_dimension_format,
-    to_numpy_array,
 )
 from ...image_utils import (
     OPENAI_CLIP_MEAN,
@@ -36,6 +34,7 @@ from ...image_utils import (
     ImageInput,
     PILImageResampling,
     make_list_of_images,
+    to_numpy_array,
     valid_images,
 )
 from ...utils import TensorType, is_torch_available, logging
@@ -48,7 +47,6 @@ if is_torch_available():
 logger = logging.get_logger(__name__)
 
 
-# Copied from transformers.models.detr.modeling_detr._upcast
 def _upcast(t):
     # Protects from numerical overflows in multiplications by upcasting to the equivalent higher type
     if t.is_floating_point():
@@ -210,19 +208,6 @@ class OwlViTImageProcessor(BaseImageProcessor):
         """
         return rescale(image, rescale_factor, data_format=data_format, **kwargs)
 
-    def normalize(
-        self,
-        image: np.ndarray,
-        mean: List[float],
-        std: List[float],
-        data_format: Optional[Union[str, ChannelDimension]] = None,
-        **kwargs,
-    ) -> np.ndarray:
-        """
-        Normalize an image with a certain mean and standard deviation.
-        """
-        return normalize(image, mean, std, data_format=data_format, **kwargs)
-
     def preprocess(
         self,
         images: ImageInput,
@@ -354,7 +339,7 @@ class OwlViTImageProcessor(BaseImageProcessor):
         # TODO: (amy) add support for other frameworks
         warnings.warn(
             "`post_process` is deprecated and will be removed in v5 of Transformers, please use"
-            " `post_process_object_detection`",
+            " `post_process_object_detection` instead, with `threshold=0.` for equivalent results.",
             FutureWarning,
         )
 
